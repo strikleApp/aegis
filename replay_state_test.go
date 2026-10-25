@@ -232,3 +232,84 @@ func TestMapParallelDurably(t *testing.T) {
 		t.Fatalf("expected cached content, got %s", results2[0])
 	}
 }
+
+func TestReplay_CyclicSignalVersioning(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryStore()
+	runID := "cyclic-signal-run"
+
+	type ReviewDecision struct {
+		Action string `json:"action"` // "revise" or "accept"
+	}
+
+	type CyclicReviewState struct {
+		Attempts int
+		Approved bool
+	}
+
+	graph := NewStateGraph[CyclicReviewState]("author", 10)
+
+	graph.AddNode("author", func(rt *Runtime[CyclicReviewState]) (string, error) {
+		_, err := Step(rt, "write_draft", func(ctx context.Context, s *CyclicReviewState) (string, error) {
+			s.Attempts++
+			return fmt.Sprintf("draft_v%d", s.Attempts), nil
+		})
+		if err != nil {
+			return "", err
+		}
+		return "await_human", nil
+	})
+
+	graph.AddNode("await_human", func(rt *Runtime[CyclicReviewState]) (string, error) {
+		decision, err := WaitForSignal[CyclicReviewState, ReviewDecision](rt, "review_decision")
+		if err != nil {
+			return "", err // Returns ErrWorkflowSuspended
+		}
+
+		if decision.Action == "accept" {
+			rt.State().Approved = true
+			return EndNode, nil
+		}
+		return "author", nil // Loop back to author
+	})
+
+	// Turn 1: Graph runs and suspends on signal:review_decision:1
+	rt1 := NewRuntime[CyclicReviewState](ctx, store, runID, &CyclicReviewState{})
+	err1 := graph.Execute(rt1)
+	if !errors.Is(err1, ErrWorkflowSuspended) {
+		t.Fatalf("expected ErrWorkflowSuspended on Turn 1, got %v", err1)
+	}
+
+	// Human provides signal for iteration 1: "revise"
+	errSig1 := ProvideSignalVersion(ctx, store, runID, "review_decision", 1, ReviewDecision{Action: "revise"})
+	if errSig1 != nil {
+		t.Fatalf("failed to provide signal 1: %v", errSig1)
+	}
+
+	// Turn 2: Graph resumes, reads signal 1 ("revise"), loops back to "author" (Attempts=2), and hits signal:review_decision:2!
+	// It must SUSPEND because signal 2 has NOT been provided yet!
+	rt2 := NewRuntime[CyclicReviewState](ctx, store, runID, &CyclicReviewState{})
+	err2 := graph.Execute(rt2)
+	if !errors.Is(err2, ErrWorkflowSuspended) {
+		t.Fatalf("expected ErrWorkflowSuspended on Turn 2 awaiting second signal, got %v", err2)
+	}
+	if rt2.State().Attempts != 2 {
+		t.Fatalf("expected Attempts=2 on turn 2, got %d", rt2.State().Attempts)
+	}
+
+	// Human provides signal for iteration 2: "accept"
+	errSig2 := ProvideSignalVersion(ctx, store, runID, "review_decision", 2, ReviewDecision{Action: "accept"})
+	if errSig2 != nil {
+		t.Fatalf("failed to provide signal 2: %v", errSig2)
+	}
+
+	// Turn 3: Graph resumes, reads signal 2 ("accept"), marks Approved=true and completes!
+	rt3 := NewRuntime[CyclicReviewState](ctx, store, runID, &CyclicReviewState{})
+	err3 := graph.Execute(rt3)
+	if err3 != nil {
+		t.Fatalf("failed to complete on turn 3: %v", err3)
+	}
+	if !rt3.State().Approved || rt3.State().Attempts != 2 {
+		t.Fatalf("expected Approved=true and Attempts=2, got approved=%v, attempts=%d", rt3.State().Approved, rt3.State().Attempts)
+	}
+}

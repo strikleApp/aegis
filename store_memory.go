@@ -61,6 +61,7 @@ func (m *MemoryStore) ReleaseLease(ctx context.Context, runID, workerID string) 
 }
 
 // GetStep fetches a memoized checkpoint for a runID and versioned stepID.
+// It returns a deep copy of byte slices to prevent data race corruption.
 func (m *MemoryStore) GetStep(ctx context.Context, runID, versionedStepID string) (EventRecord, bool, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -75,10 +76,20 @@ func (m *MemoryStore) GetStep(ctx context.Context, runID, versionedStepID string
 		return EventRecord{}, false, nil
 	}
 
-	return record, true, nil
+	outCopy := record
+	if len(record.OutputPayload) > 0 {
+		outCopy.OutputPayload = make([]byte, len(record.OutputPayload))
+		copy(outCopy.OutputPayload, record.OutputPayload)
+	}
+	if len(record.StateSnapshot) > 0 {
+		outCopy.StateSnapshot = make([]byte, len(record.StateSnapshot))
+		copy(outCopy.StateSnapshot, record.StateSnapshot)
+	}
+
+	return outCopy, true, nil
 }
 
-// SaveStep persists a step record in memory.
+// SaveStep persists a step record in memory with deep-copied byte slices.
 func (m *MemoryStore) SaveStep(ctx context.Context, runID string, record EventRecord) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -86,6 +97,17 @@ func (m *MemoryStore) SaveStep(ctx context.Context, runID string, record EventRe
 	if _, ok := m.steps[runID]; !ok {
 		m.steps[runID] = make(map[string]EventRecord)
 	}
-	m.steps[runID][record.StepID] = record
+
+	recCopy := record
+	if len(record.OutputPayload) > 0 {
+		recCopy.OutputPayload = make([]byte, len(record.OutputPayload))
+		copy(recCopy.OutputPayload, record.OutputPayload)
+	}
+	if len(record.StateSnapshot) > 0 {
+		recCopy.StateSnapshot = make([]byte, len(record.StateSnapshot))
+		copy(recCopy.StateSnapshot, record.StateSnapshot)
+	}
+
+	m.steps[runID][record.StepID] = recCopy
 	return nil
 }

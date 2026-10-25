@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 )
 
 type TestAgentState struct {
@@ -89,5 +90,37 @@ func TestRuntime_CostBudgetBreaker(t *testing.T) {
 	// Context should now be cancelled automatically
 	if rt.Context().Err() == nil {
 		t.Fatal("expected context to be cancelled after budget trip")
+	}
+}
+
+type testHook struct {
+	beforeCalls int
+	afterCalls  int
+}
+
+func (h *testHook) BeforeStep(ctx context.Context, runID, stepID string) {
+	h.beforeCalls++
+}
+
+func (h *testHook) AfterStep(ctx context.Context, runID, stepID string, duration time.Duration, err error) {
+	h.afterCalls++
+}
+
+func TestRuntime_StepHooks(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryStore()
+	hook := &testHook{}
+
+	rt := NewRuntime[TestAgentState](ctx, store, "run-hook-1", &TestAgentState{}, WithStepHooks[TestAgentState](hook))
+
+	_, err := Step(rt, "hooked_step", func(ctx context.Context, s *TestAgentState) (string, error) {
+		return "ok", nil
+	})
+	if err != nil {
+		t.Fatalf("step error: %v", err)
+	}
+
+	if hook.beforeCalls != 1 || hook.afterCalls != 1 {
+		t.Fatalf("expected 1 before and 1 after call, got before=%d, after=%d", hook.beforeCalls, hook.afterCalls)
 	}
 }

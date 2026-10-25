@@ -43,6 +43,13 @@ func WithCostBudget[T any](maxCostUSD float64) RuntimeOption[T] {
 	}
 }
 
+// WithStepHooks registers observability/tracing hooks around every step execution.
+func WithStepHooks[T any](hooks ...StepHook) RuntimeOption[T] {
+	return func(rt *Runtime[T]) {
+		rt.hooks = append(rt.hooks, hooks...)
+	}
+}
+
 // Runtime maintains execution context, state, step versioning, and lease fencing.
 type Runtime[T any] struct {
 	ctx        context.Context
@@ -54,6 +61,7 @@ type Runtime[T any] struct {
 	leaseTTL   time.Duration
 	state      *T
 	maxCostUSD float64
+	hooks      []StepHook
 
 	mu             sync.RWMutex
 	currentCostUSD float64
@@ -186,12 +194,25 @@ func executeVersionedStep[T any, R any](rt *Runtime[T], versionedID string, snap
 		return zero, err
 	}
 
+	start := time.Now()
+	for _, h := range rt.hooks {
+		h.BeforeStep(rt.ctx, rt.runID, versionedID)
+	}
+	var stepErr error
+	defer func() {
+		duration := time.Since(start)
+		for _, h := range rt.hooks {
+			h.AfterStep(rt.ctx, rt.runID, versionedID, duration, stepErr)
+		}
+	}()
+
 	// 1. Check Store for existing memoized step result (Replay Path)
 	if record, hit, err := rt.store.GetStep(rt.ctx, rt.runID, versionedID); err == nil && hit {
 		if record.Status == "completed" {
 			var cachedResult R
 			if err := json.Unmarshal(record.OutputPayload, &cachedResult); err != nil {
-				return zero, fmt.Errorf("%w: unmarshal output %q: %v", ErrInvalidStepResult, versionedID, err)
+				stepErr = fmt.Errorf("%w: unmarshal output %q: %v", ErrInvalidStepResult, versionedID, err)
+				return zero, stepErr
 			}
 			// Restore mutated State snapshot so replay keeps state in sync!
 			if snapshotState && len(record.StateSnapshot) > 0 {
@@ -201,6 +222,7 @@ func executeVersionedStep[T any, R any](rt *Runtime[T], versionedID string, snap
 			}
 			if record.CostUSD > 0 {
 				if err := rt.TrackCost(record.CostUSD); err != nil {
+					stepErr = err
 					return zero, err
 				}
 			}
@@ -212,14 +234,16 @@ func executeVersionedStep[T any, R any](rt *Runtime[T], versionedID string, snap
 	costBefore := rt.CurrentCost()
 	result, err := fn(rt.ctx, rt.State())
 	if err != nil {
-		return zero, fmt.Errorf("%w: step %q: %v", ErrStepFailed, versionedID, err)
+		stepErr = fmt.Errorf("%w: step %q: %v", ErrStepFailed, versionedID, err)
+		return zero, stepErr
 	}
 	stepCost := rt.CurrentCost() - costBefore
 
 	// 3. Serialize both step output AND current state snapshot
 	payload, err := json.Marshal(result)
 	if err != nil {
-		return zero, fmt.Errorf("%w: marshal output %q: %v", ErrInvalidStepResult, versionedID, err)
+		stepErr = fmt.Errorf("%w: marshal output %q: %v", ErrInvalidStepResult, versionedID, err)
+		return zero, stepErr
 	}
 
 	var stateBytes []byte
@@ -241,21 +265,34 @@ func executeVersionedStep[T any, R any](rt *Runtime[T], versionedID string, snap
 	}
 
 	if err := rt.store.SaveStep(rt.ctx, rt.runID, record); err != nil {
-		return zero, fmt.Errorf("aegis: failed to checkpoint step %q: %w", versionedID, err)
+		stepErr = fmt.Errorf("aegis: failed to checkpoint step %q: %w", versionedID, err)
+		return zero, stepErr
 	}
 
 	return result, nil
 }
 
 // WaitForSignal pauses workflow execution (returning ErrWorkflowSuspended) until ProvideSignal is called.
-// It allows human approval or external webhooks without keeping a goroutine active in memory.
+// It tracks invocation count so cyclic agent loops asking for approvals on multiple iterations
+// never read stale signals from previous iterations.
 func WaitForSignal[T any, S any](rt *Runtime[T], signalName string) (S, error) {
 	var zero S
-	signalKey := "signal:" + signalName
-	record, hit, err := rt.store.GetStep(rt.ctx, rt.runID, signalKey)
+	versionedKey := rt.nextVersionedStepID("signal:" + signalName)
+
+	// Check versioned key first (e.g. signal:approval:1, signal:approval:2)
+	record, hit, err := rt.store.GetStep(rt.ctx, rt.runID, versionedKey)
 	if err != nil {
 		return zero, err
 	}
+
+	// Fallback for unversioned signals on first iteration
+	if !hit && versionedKey == "signal:"+signalName+":1" {
+		record, hit, err = rt.store.GetStep(rt.ctx, rt.runID, "signal:"+signalName)
+		if err != nil {
+			return zero, err
+		}
+	}
+
 	if !hit || record.Status != "completed" {
 		return zero, fmt.Errorf("%w: awaiting signal %q", ErrWorkflowSuspended, signalName)
 	}
@@ -268,15 +305,34 @@ func WaitForSignal[T any, S any](rt *Runtime[T], signalName string) (S, error) {
 
 // ProvideSignal injects an external payload (from a human UI or webhook) into the Store so a suspended workflow can resume.
 func ProvideSignal[S any](ctx context.Context, store Store, runID, signalName string, payload S) error {
+	return ProvideSignalVersion(ctx, store, runID, signalName, 1, payload)
+}
+
+// ProvideSignalVersion injects an external payload for a specific cycle iteration of a signal.
+func ProvideSignalVersion[S any](ctx context.Context, store Store, runID, signalName string, version int, payload S) error {
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
-	return store.SaveStep(ctx, runID, EventRecord{
+	if version <= 0 {
+		version = 1
+	}
+
+	rec := EventRecord{
 		RunID:         runID,
-		StepID:        "signal:" + signalName,
+		StepID:        fmt.Sprintf("signal:%s:%d", signalName, version),
 		OutputPayload: raw,
 		Status:        "completed",
 		CreatedAt:     time.Now().UTC(),
-	})
+	}
+	if err := store.SaveStep(ctx, runID, rec); err != nil {
+		return err
+	}
+
+	// Keep unversioned key in sync for version 1 backwards compatibility
+	if version == 1 {
+		rec.StepID = "signal:" + signalName
+		_ = store.SaveStep(ctx, runID, rec)
+	}
+	return nil
 }

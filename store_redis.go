@@ -14,7 +14,8 @@ import (
 )
 
 const (
-	// CompressionThreshold is the byte threshold above which step payloads are automatically gzip-compressed.
+	// CompressionThreshold is the combined byte threshold above which step payloads
+	// and state snapshots are automatically gzip-compressed.
 	CompressionThreshold = 4096
 
 	luaReleaseLease = `
@@ -84,28 +85,39 @@ func (s *RedisStore) GetStep(ctx context.Context, runID, versionedStepID string)
 		return EventRecord{}, false, err
 	}
 
-	// Decompress output payload if compressed before transmission
-	if rec.Compressed && len(rec.OutputPayload) > 0 {
-		decompressed, err := decompressGzip(rec.OutputPayload)
-		if err != nil {
-			return EventRecord{}, false, fmt.Errorf("aegis: failed to decompress step payload: %w", err)
+	// Decompress output payload and state snapshot if compressed before transmission
+	if rec.Compressed {
+		if len(rec.OutputPayload) > 0 {
+			decompressed, err := decompressGzip(rec.OutputPayload)
+			if err != nil {
+				return EventRecord{}, false, fmt.Errorf("aegis: decompress output: %w", err)
+			}
+			rec.OutputPayload = decompressed
 		}
-		rec.OutputPayload = decompressed
+		if len(rec.StateSnapshot) > 0 {
+			decompressedState, err := decompressGzip(rec.StateSnapshot)
+			if err != nil {
+				return EventRecord{}, false, fmt.Errorf("aegis: decompress state snapshot: %w", err)
+			}
+			rec.StateSnapshot = decompressedState
+		}
 		rec.Compressed = false
 	}
 
 	return rec, true, nil
 }
 
-// SaveStep persists a step record to Redis Hash with automatic payload compression and TTL refresh.
+// SaveStep persists a step record to Redis Hash with automatic payload & state compression and TTL refresh.
 func (s *RedisStore) SaveStep(ctx context.Context, runID string, record EventRecord) error {
 	key := fmt.Sprintf("aegis:steps:%s", runID)
 
-	// Transparently compress large payloads to conserve Redis RAM
-	if len(record.OutputPayload) > CompressionThreshold {
-		compressed, err := compressGzip(record.OutputPayload)
-		if err == nil {
-			record.OutputPayload = compressed
+	// Transparently compress both OutputPayload and StateSnapshot when combined size exceeds threshold
+	if len(record.OutputPayload)+len(record.StateSnapshot) > CompressionThreshold {
+		outComp, err1 := compressGzip(record.OutputPayload)
+		stateComp, err2 := compressGzip(record.StateSnapshot)
+		if err1 == nil && err2 == nil {
+			record.OutputPayload = outComp
+			record.StateSnapshot = stateComp
 			record.Compressed = true
 		}
 	}
@@ -123,6 +135,9 @@ func (s *RedisStore) SaveStep(ctx context.Context, runID string, record EventRec
 }
 
 func compressGzip(src []byte) ([]byte, error) {
+	if len(src) == 0 {
+		return nil, nil
+	}
 	var buf bytes.Buffer
 	zw := gzip.NewWriter(&buf)
 	if _, err := zw.Write(src); err != nil {
@@ -135,6 +150,9 @@ func compressGzip(src []byte) ([]byte, error) {
 }
 
 func decompressGzip(src []byte) ([]byte, error) {
+	if len(src) == 0 {
+		return nil, nil
+	}
 	zr, err := gzip.NewReader(bytes.NewReader(src))
 	if err != nil {
 		return nil, err
