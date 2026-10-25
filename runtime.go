@@ -97,6 +97,11 @@ func (rt *Runtime[T]) TenantID() string {
 	return rt.tenantID
 }
 
+// LeaseTTL returns the configured lease TTL.
+func (rt *Runtime[T]) LeaseTTL() time.Duration {
+	return rt.leaseTTL
+}
+
 // State returns the current workflow state.
 func (rt *Runtime[T]) State() *T {
 	rt.mu.RLock()
@@ -167,37 +172,61 @@ func (rt *Runtime[T]) nextVersionedStepID(baseStepID string) string {
 	return fmt.Sprintf("%s:%d", baseStepID, rt.stepCounts[baseStepID])
 }
 
-// Step executes a named logic unit with deterministic memoization and versioned checkpointing.
+// Step executes a named logic unit with deterministic memoization AND state snapshot restoration.
 // In cyclic graphs (e.g. Planner -> Tool -> Critic -> Planner), successive visits to the same step
 // automatically version to planner:1, planner:2, ensuring correct replay without cache collisions.
+// When replaying from a cache hit, any mutations to state T are accurately restored from StateSnapshot.
 func Step[T any, R any](rt *Runtime[T], baseStepID string, fn func(ctx context.Context, state *T) (R, error)) (R, error) {
+	return executeVersionedStep(rt, rt.nextVersionedStepID(baseStepID), true, fn)
+}
+
+func executeVersionedStep[T any, R any](rt *Runtime[T], versionedID string, snapshotState bool, fn func(ctx context.Context, state *T) (R, error)) (R, error) {
 	var zero R
 	if err := rt.ctx.Err(); err != nil {
 		return zero, err
 	}
 
-	versionedID := rt.nextVersionedStepID(baseStepID)
-
-	// 1. Check hot cache for existing memoized step result
+	// 1. Check Store for existing memoized step result (Replay Path)
 	if record, hit, err := rt.store.GetStep(rt.ctx, rt.runID, versionedID); err == nil && hit {
 		if record.Status == "completed" {
 			var cachedResult R
-			if err := json.Unmarshal(record.OutputPayload, &cachedResult); err == nil {
-				return cachedResult, nil
+			if err := json.Unmarshal(record.OutputPayload, &cachedResult); err != nil {
+				return zero, fmt.Errorf("%w: unmarshal output %q: %v", ErrInvalidStepResult, versionedID, err)
 			}
+			// Restore mutated State snapshot so replay keeps state in sync!
+			if snapshotState && len(record.StateSnapshot) > 0 {
+				rt.mu.Lock()
+				_ = json.Unmarshal(record.StateSnapshot, rt.state)
+				rt.mu.Unlock()
+			}
+			if record.CostUSD > 0 {
+				if err := rt.TrackCost(record.CostUSD); err != nil {
+					return zero, err
+				}
+			}
+			return cachedResult, nil
 		}
 	}
 
-	// 2. Execute fresh step logic
+	// 2. Execute live step logic
+	costBefore := rt.CurrentCost()
 	result, err := fn(rt.ctx, rt.State())
 	if err != nil {
 		return zero, fmt.Errorf("%w: step %q: %v", ErrStepFailed, versionedID, err)
 	}
+	stepCost := rt.CurrentCost() - costBefore
 
-	// 3. Serialize and checkpoint result
+	// 3. Serialize both step output AND current state snapshot
 	payload, err := json.Marshal(result)
 	if err != nil {
-		return zero, fmt.Errorf("%w: failed to marshal step result %q: %v", ErrInvalidStepResult, versionedID, err)
+		return zero, fmt.Errorf("%w: marshal output %q: %v", ErrInvalidStepResult, versionedID, err)
+	}
+
+	var stateBytes []byte
+	if snapshotState {
+		rt.mu.RLock()
+		stateBytes, _ = json.Marshal(rt.state)
+		rt.mu.RUnlock()
 	}
 
 	record := EventRecord{
@@ -205,6 +234,8 @@ func Step[T any, R any](rt *Runtime[T], baseStepID string, fn func(ctx context.C
 		StepID:        versionedID,
 		TenantID:      rt.tenantID,
 		OutputPayload: payload,
+		StateSnapshot: stateBytes,
+		CostUSD:       stepCost,
 		Status:        "completed",
 		CreatedAt:     time.Now().UTC(),
 	}
@@ -214,4 +245,38 @@ func Step[T any, R any](rt *Runtime[T], baseStepID string, fn func(ctx context.C
 	}
 
 	return result, nil
+}
+
+// WaitForSignal pauses workflow execution (returning ErrWorkflowSuspended) until ProvideSignal is called.
+// It allows human approval or external webhooks without keeping a goroutine active in memory.
+func WaitForSignal[T any, S any](rt *Runtime[T], signalName string) (S, error) {
+	var zero S
+	signalKey := "signal:" + signalName
+	record, hit, err := rt.store.GetStep(rt.ctx, rt.runID, signalKey)
+	if err != nil {
+		return zero, err
+	}
+	if !hit || record.Status != "completed" {
+		return zero, fmt.Errorf("%w: awaiting signal %q", ErrWorkflowSuspended, signalName)
+	}
+	var sig S
+	if err := json.Unmarshal(record.OutputPayload, &sig); err != nil {
+		return zero, fmt.Errorf("%w: invalid signal payload %q: %v", ErrInvalidStepResult, signalName, err)
+	}
+	return sig, nil
+}
+
+// ProvideSignal injects an external payload (from a human UI or webhook) into the Store so a suspended workflow can resume.
+func ProvideSignal[S any](ctx context.Context, store Store, runID, signalName string, payload S) error {
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	return store.SaveStep(ctx, runID, EventRecord{
+		RunID:         runID,
+		StepID:        "signal:" + signalName,
+		OutputPayload: raw,
+		Status:        "completed",
+		CreatedAt:     time.Now().UTC(),
+	})
 }

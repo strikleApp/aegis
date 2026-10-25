@@ -3,6 +3,7 @@ package aegis
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"golang.org/x/sync/errgroup"
 )
@@ -14,7 +15,7 @@ const EndNode = "__end__"
 // It returns the name of the next node to transition to, or EndNode when finished.
 type GraphNode[T any] func(rt *Runtime[T]) (nextNode string, err error)
 
-// StateGraph coordinates cyclic agent workflows with explicit loop guardrails.
+// StateGraph coordinates cyclic agent workflows with explicit loop guardrails and lease heartbeat.
 type StateGraph[T any] struct {
 	nodes     map[string]GraphNode[T]
 	entryNode string
@@ -38,7 +39,7 @@ func (g *StateGraph[T]) AddNode(name string, fn GraphNode[T]) {
 	g.nodes[name] = fn
 }
 
-// Execute runs the cyclic graph with distributed lease fencing, cancellation checks, and cycle limits.
+// Execute runs the cyclic graph with distributed lease fencing, automatic lease heartbeat renewal, and cycle limits.
 func (g *StateGraph[T]) Execute(rt *Runtime[T]) error {
 	// 1. Acquire distributed lease fencing lock to prevent split-brain execution
 	acquired, err := rt.AcquireLease()
@@ -50,6 +51,22 @@ func (g *StateGraph[T]) Execute(rt *Runtime[T]) error {
 	}
 	defer func() {
 		_ = rt.ReleaseLease()
+	}()
+
+	// 2. Background lease heartbeat prevents lock expiration during slow LLM calls
+	hbCtx, stopHeartbeat := context.WithCancel(rt.Context())
+	defer stopHeartbeat()
+	go func() {
+		ticker := time.NewTicker(rt.LeaseTTL() / 3)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				_, _ = rt.AcquireLease() // Renews TTL since workerID matches
+			case <-hbCtx.Done():
+				return
+			}
+		}
 	}()
 
 	current := g.entryNode
@@ -77,6 +94,53 @@ func (g *StateGraph[T]) Execute(rt *Runtime[T]) error {
 	}
 
 	return ErrMaxCyclesReached
+}
+
+// MapParallelDurably fans out items across a bounded goroutine pool while deterministically
+// checkpointing each item's output as "<baseStepID>:<batchVersion>:<itemIndex>".
+func MapParallelDurably[T any, I any, O any](
+	rt *Runtime[T],
+	baseStepID string,
+	limit int,
+	items []I,
+	fn func(ctx context.Context, item I) (O, error),
+) ([]O, error) {
+	if len(items) == 0 {
+		return nil, nil
+	}
+	if limit <= 0 {
+		limit = 10
+	}
+
+	// Reserve a deterministic batch version ID on the caller goroutine BEFORE spawning concurrent workers
+	batchStepID := rt.nextVersionedStepID(baseStepID)
+	results := make([]O, len(items))
+
+	g, egCtx := errgroup.WithContext(rt.Context())
+	g.SetLimit(limit)
+
+	for i, item := range items {
+		idx := i
+		val := item
+		itemStepID := fmt.Sprintf("%s:%d", batchStepID, idx)
+
+		g.Go(func() error {
+			// Pass snapshotState=false so parallel workers don't race on marshaling shared rt.State()
+			out, err := executeVersionedStep(rt, itemStepID, false, func(_ context.Context, _ *T) (O, error) {
+				return fn(egCtx, val)
+			})
+			if err != nil {
+				return err
+			}
+			results[idx] = out
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	return results, nil
 }
 
 // RunParallelGroup uses errgroup.WithContext with strict concurrency limits to prevent goroutine exhaustion.

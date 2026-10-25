@@ -1,38 +1,6 @@
 services:
-  caddy:
-    image: caddy:2-alpine
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-    depends_on:
-      - aegis-worker
-
-  aegis-worker:
-    build: .
-    environment:
-      - REDIS_ADDR=redis:6379
-      - LOG_FORMAT=json
-    deploy:
-      resources:
-        limits:
-          cpus: "1.0"
-          memory: 256M
-    healthcheck:
-      test: ["CMD", "/app/aegis-worker", "-healthcheck"]
-      interval: 10s
-      timeout: 2s
-      retries: 3
-    depends_on:
-      redis:
-        condition: service_healthy
-
   redis:
     image: redis:7-alpine
-    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy volatile-lru
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 2s
-      retries: 3
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes

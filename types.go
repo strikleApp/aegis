@@ -21,16 +21,21 @@ var (
 
 	// ErrInvalidStepResult is returned when a cached step payload cannot be deserialized.
 	ErrInvalidStepResult = errors.New("aegis: invalid step output payload")
+
+	// ErrWorkflowSuspended is returned when execution pauses waiting for an external human or webhook signal.
+	ErrWorkflowSuspended = errors.New("aegis: workflow suspended awaiting external signal")
 )
 
 // EventRecord represents an immutable, durable checkpoint for a single versioned step.
+// It snapshots both the step return value (OutputPayload) and the mutated workflow state (StateSnapshot).
 type EventRecord struct {
 	RunID         string    `json:"run_id"`
-	StepID        string    `json:"step_id"` // e.g. "planner:1", "critic:2"
+	StepID        string    `json:"step_id"` // e.g. "planner:1", "map_scrape:1:3"
 	TenantID      string    `json:"tenant_id,omitempty"`
-	OutputPayload []byte    `json:"output_payload"`
+	OutputPayload []byte    `json:"output_payload"` // Serialized return value R of Step()
+	StateSnapshot []byte    `json:"state_snapshot"` // Serialized state T after Step() mutated it
 	CostUSD       float64   `json:"cost_usd,omitempty"`
-	Status        string    `json:"status"` // "completed", "failed", "suspended"
+	Status        string    `json:"status"` // "completed", "suspended"
 	Compressed    bool      `json:"compressed,omitempty"`
 	CreatedAt     time.Time `json:"created_at"`
 }
