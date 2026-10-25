@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/aashish/aegis"
+	"github.com/strikleApp/aegis"
 )
 
 type ResearchState struct {

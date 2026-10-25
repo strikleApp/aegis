@@ -1,8 +1,8 @@
 # aegis ⚡
 > Durable, event-driven agentic runtime in Go designed to outperform static state machines through deterministic event sourcing, cyclic loop versioning, state snapshot replay, and distributed backpressure.
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/aashish/aegis.svg)](https://pkg.go.dev/github.com/aashish/aegis)
-[![Go Report Card](https://goreportcard.com/badge/github.com/aashish/aegis)](https://goreportcard.com/report/github.com/aashish/aegis)
+[![Go Reference](https://pkg.go.dev/badge/github.com/strikleApp/aegis.svg)](https://pkg.go.dev/github.com/strikleApp/aegis)
+[![Go Report Card](https://goreportcard.com/badge/github.com/strikleApp/aegis)](https://goreportcard.com/report/github.com/strikleApp/aegis)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 ---
@@ -68,7 +68,7 @@ Calling naive concurrent steps leads to non-deterministic `:1, :2` order races. 
 ## 3. Installation
 
 ```bash
-go get github.com/aashish/aegis
+go get github.com/strikleApp/aegis
 ```
 
 Requires Go 1.23 or newer. Zero external C-bindings.
@@ -85,7 +85,7 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/aashish/aegis"
+	"github.com/strikleApp/aegis"
 )
 
 type ResearchState struct {

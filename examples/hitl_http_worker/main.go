@@ -13,7 +13,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/aashish/aegis"
+	"github.com/strikleApp/aegis"
 )
 
 type ApprovalSignal struct {

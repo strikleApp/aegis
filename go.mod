@@ -1,4 +1,4 @@
-module github.com/aashish/aegis
+module github.com/strikleApp/aegis
 
 go 1.26.0
 
