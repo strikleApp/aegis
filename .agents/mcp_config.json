@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "gopls": {
+      "command": "/bin/bash",
+      "args": [
+        "-c",
+        "cd '/Users/aashish/Development/Go Project/aegis' && exec /Users/aashish/go/bin/gopls mcp"
+      ],
+      "env": {}
+    }
+  }
+}
